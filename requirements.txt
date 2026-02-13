@@ -1,9 +1,5 @@
-opencv-python
-mediapipe
-numpy
-tensorflow
-pygame
 opencv-python-headless
 tensorflow-cpu
 streamlit
 streamlit-webrtc
+numpy
