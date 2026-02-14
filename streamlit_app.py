@@ -4,10 +4,12 @@ import cv2
 import tensorflow as tf
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import os
 import av
 
-# --- CONFIGURATION ---
+# --- PAGE CONFIG ---
 st.set_page_config(page_title="Driver Drowsiness Detector", layout="wide")
 st.title("🚗 Real-Time Drowsiness Detection")
 
@@ -16,83 +18,96 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'mouth_cnn.h5')
 LANDMARKER_PATH = os.path.join(BASE_DIR, 'face_landmarker.task')
 
-# Load TensorFlow Model
+# --- LOAD MODELS ---
 @st.cache_resource
-def load_keras_model():
-    return tf.keras.models.load_model(MODEL_PATH)
+def load_models():
+    # Load the Drowsiness CNN
+    cnn_model = tf.keras.models.load_model(MODEL_PATH)
+    
+    # Initialize MediaPipe Face Landmarker (New Tasks API)
+    base_options = python.BaseOptions(model_asset_path=LANDMARKER_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=True,
+        running_mode=vision.RunningMode.VIDEO, # optimized for video frames
+        num_faces=1
+    )
+    landmarker = vision.FaceLandmarker.create_from_options(options)
+    return cnn_model, landmarker
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+cnn_model, landmarker = load_models()
 
-model = load_keras_model()
-
-# --- WEB-RTC CALLBACK ---
+# --- PROCESSING LOGIC ---
 def video_frame_callback(frame):
     img = frame.to_ndarray(format="bgr24")
     h, w, _ = img.shape
     
-    # 1. MediaPipe Face Detection
-    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_img)
+    # Convert OpenCV BGR to MediaPipe Image
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     
-    status = "Searching for Face..."
+    # Get timestamp in milliseconds (required for VIDEO mode)
+    timestamp_ms = int(frame.time * 1000)
+    
+    # Run MediaPipe Detection
+    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+    
+    status = "Scanning..."
     color = (255, 255, 255)
 
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            # 2. Extract Mouth Region (landmarks 0, 13, 14, 17 are around the lips)
-            # We'll use a bounding box approach for simplicity
-            mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308]
-            x_coords = [int(face_landmarks.landmark[i].x * w) for i in mouth_indices]
-            y_coords = [int(face_landmarks.landmark[i].y * h) for i in mouth_indices]
-            
-            x1, y1 = min(x_coords) - 10, min(y_coords) - 10
-            x2, y2 = max(x_coords) + 10, max(y_coords) + 10
-            
-            # Crop and Predict
-            try:
-                mouth_crop = img[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                if mouth_crop.size > 0:
-                    # Prepare for CNN (Assumes 224x224 input)
-                    input_img = cv2.resize(mouth_crop, (224, 224))
-                    input_img = input_img / 255.0
-                    input_img = np.expand_dims(input_img, axis=0)
-                    
-                    prediction = model.predict(input_img, verbose=0)
-                    
-                    # 3. Logic based on your model's output
-                    # Assuming 0 = Drowsy/Yawn, 1 = Active
-                    if prediction[0][0] < 0.5:
-                        status = "DROWSY ALERT!"
-                        color = (0, 0, 255) # Red
-                    else:
-                        status = "Active"
-                        color = (0, 255, 0) # Green
+    if result.face_landmarks:
+        # Get landmarks for the first face detected
+        face_landmarks = result.face_landmarks[0]
+        
+        # Mouth indices for cropping (Standard MediaPipe Mesh indices)
+        mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308]
+        
+        x_coords = [int(face_landmarks[i].x * w) for i in mouth_indices]
+        y_coords = [int(face_landmarks[i].y * h) for i in mouth_indices]
+        
+        # Calculate bounding box for the mouth
+        x1, y1 = max(0, min(x_coords) - 15), max(0, min(y_coords) - 15)
+        x2, y2 = min(w, max(x_coords) + 15), min(h, max(y_coords) + 15)
+        
+        # Predict Drowsiness
+        try:
+            mouth_crop = img[y1:y2, x1:x2]
+            if mouth_crop.size > 0:
+                # Resize to match your CNN input (assuming 224x224)
+                resized = cv2.resize(mouth_crop, (224, 224))
+                normalized = resized / 255.0
+                reshaped = np.reshape(normalized, (1, 224, 224, 3))
                 
-                # Draw box around mouth
-                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-            except Exception as e:
-                pass
+                prediction = cnn_model.predict(reshaped, verbose=0)
+                
+                # Threshold logic (adjust based on your model's training)
+                if prediction[0][0] < 0.5:
+                    status = "DROWSY / YAWNING"
+                    color = (0, 0, 255) # Red
+                else:
+                    status = "Driver Active"
+                    color = (0, 255, 0) # Green
+            
+            # Visual Feedback
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        except Exception:
+            pass
 
-    # Overlay Text
-    cv2.putText(img, status, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-    
+    # UI Overlay
+    cv2.putText(img, status, (30, 50), cv2.FONT_HERSHEY_DUPLEX, 1, color, 2)
     return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # --- UI START ---
 webrtc_streamer(
-    key="drowsiness",
+    key="drowsiness-check",
     video_frame_callback=video_frame_callback,
-    rtc_configuration={
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    },
+    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
     media_stream_constraints={"video": True, "audio": False},
+    async_processing=True,
 )
 
-st.sidebar.info("This system uses MediaPipe for face tracking and a custom CNN for mouth analysis.")
+st.sidebar.markdown("""
+### System Details
+- **Tracker:** MediaPipe FaceLandmarker (.task)
+- **Classifier:** Custom Mouth CNN (.h5)
+- **Status:** Running on CPU
+""")
