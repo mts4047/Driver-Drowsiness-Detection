@@ -3,5 +3,4 @@ streamlit-webrtc
 av
 opencv-python-headless
 tensorflow-cpu
-numpy
-mediapipe==0.10.14
+mediapipe
