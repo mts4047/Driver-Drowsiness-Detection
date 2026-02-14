@@ -4,4 +4,4 @@ av
 opencv-python-headless
 tensorflow-cpu
 numpy
-mediapipe
+mediapipe==0.10.14
